@@ -1,0 +1,90 @@
+
+name: Docker Image CI/CD with Caching
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+env:
+  DOCKER_REPO_PREFIX: ${{ secrets.DOCKERHUB_USERNAME }} # Use GitHub Secrets for repository prefix
+
+jobs:
+  # Job to generate a Docker image tag
+  generate-image-tag:
+    name: Generate Docker Image Tag
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.generate-image-tag.outputs.image_tag }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch full history for git describe
+
+      - name: Generate Image Tag
+        id: generate-image-tag
+        run: |
+          # Use the tag name if triggered by a tag; otherwise, derive from the latest semver tag or fallback to commit hash.
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            image_tag="${{ github.ref_name }}" # Use the Git tag as the image tag
+          else
+            # Generate tag based on the latest semver Git tag or fallback to commit hash
+            image_tag=$(git describe --tags --always --first-parent --match "v[0-9]*.[0-9]*.[0-9]*" || true)
+
+            # Fallback to short commit hash if no valid tag
+            if [ -z "$image_tag" ]; then
+              echo "No valid tag found; falling back to commit hash."
+              image_tag=$(git rev-parse --short HEAD)
+            fi
+          fi
+          image_tag=$(echo "$image_tag" | sed 's/[^a-zA-Z0-9_.-]/-/g')
+          echo "image_tag=$image_tag" >> $GITHUB_OUTPUT
+
+  # Job to build and push Docker images with caching
+  build-and-push-image:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: generate-image-tag
+    strategy:
+      matrix:
+        build_config:
+          - path: demo-application/api-node
+            repo: api-node
+          - path: demo-application/client-react
+            repo: client-react
+ 
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for Multi-Architecture Builds
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Docker Image with Caching
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.build_config.path }} # Set the build context to the application directory
+          platforms: linux/amd64,linux/arm64
+          push: true # Push the built image to Docker Hub
+          #NEW: (START) ##########################################################
+          #cache-from: type=gha
+          #cache-to: type=gha,mode=max
+          #NEW: (END) ############################################################
+          cache-from: |
+            type=registry,ref=${{ env.DOCKER_REPO_PREFIX }}/${{ matrix.build_config.repo }}:build-cache
+          cache-to: |
+            type=registry,ref=${{ env.DOCKER_REPO_PREFIX }}/${{ matrix.build_config.repo }}:build-cache,mode=max
+          tags: |
+            ${{ env.DOCKER_REPO_PREFIX }}/${{ matrix.build_config.repo }}:latest
+            ${{ env.DOCKER_REPO_PREFIX }}/${{ matrix.build_config.repo }}:${{ needs.generate-image-tag.outputs.image_tag }}
